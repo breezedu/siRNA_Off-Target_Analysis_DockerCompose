@@ -17,7 +17,7 @@ A comprehensive web-based tool for predicting siRNA off-target effects using see
 ┌─────────────┐      ┌──────────────┐      ┌──────────────┐
 │   React     │─────▶│   FastAPI    │─────▶│  PostgreSQL  │
 │  Frontend   │      │   Backend    │      │   Database   │
-│  (Port 3100)│      │  (Port 8100) │      │  (Port 5432) │
+│  (Port 3000)│      │  (Port 8000) │      │  (Port 5432) │
 └─────────────┘      └──────────────┘      └──────────────┘
                             │
                             ▼
@@ -113,14 +113,13 @@ Download from NCBI RefSeq or Ensembl. Example:
 
 Using PowerShell:
 ```powershell
-$file = "C:\Users\YourName\siRNA-tool\database\data\Homo_sapiens.GRCh38.cds.all.fa"
-curl.exe -X POST -F "file=@$file" http://localhost:8100/api/upload/transcriptome
+$file = "C:\Users\YourName\siRNA-tool\database\data\human_refseq.fasta"
+curl.exe -X POST -F "file=@$file" http://localhost:8000/api/upload/transcriptome
 ```
 
 Or using curl (if installed):
 ```bash
 curl -X POST -F "file=@./database/data/human_refseq.fasta" http://localhost:8000/api/upload/transcriptome
-curl.exe -X POST "http://localhost:8100/api/build-database?transcriptome_file=Homo_sapiens.GRCh38.cds.all.fa"
 ```
 
 3. **Build Database**

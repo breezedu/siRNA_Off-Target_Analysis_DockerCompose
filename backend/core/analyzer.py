@@ -1,0 +1,350 @@
+"""
+Core siRNA Off-Target Analyzer
+Implements seed-based search and thermodynamic scoring
+"""
+
+from typing import List, Dict, Tuple
+import numpy as np
+from Bio.Seq import Seq
+from database.db import get_db_session
+from database.models import Transcript, SeedIndex
+import json
+
+class SiRNAAnalyzer:
+    def __init__(self):
+        """Initialize the analyzer with nearest-neighbor parameters"""
+        self.nn_params = self._load_nn_parameters()
+        
+    def _load_nn_parameters(self) -> Dict:
+        """
+        Load Turner nearest-neighbor thermodynamic parameters
+        Values in kcal/mol at 37°C
+        """
+        return {
+            # Watson-Crick pairs
+            'AA/UU': -0.9, 'AU/UA': -1.1, 'UA/AU': -1.3, 'UU/AA': -0.9,
+            'GA/UC': -2.1, 'GU/CA': -2.1, 'CG/GC': -2.4, 'GC/CG': -2.1,
+            'CA/GU': -2.1, 'UC/GA': -2.1, 'CU/GA': -2.1, 'AG/CU': -2.1,
+            'GG/CC': -3.3, 'CC/GG': -3.3,
+            
+            # G:U wobble pairs
+            'GU/UG': -1.4, 'UG/GU': -1.4,
+            'GU/AU': -1.3, 'UG/UA': -1.0,
+            
+            # Terminal penalties
+            'terminal_AU': 0.45,
+            'terminal_GC': 0.0,
+            
+            # Position weights
+            'seed_weight': 1.5,      # Positions 2-8
+            'central_weight': 1.0,   # Positions 9-12
+            'supplementary_weight': 0.8  # Positions 13-19
+        }
+    
+    def analyze(
+        self,
+        sirna_sequence: str,
+        max_seed_mismatches: int = 1,
+        energy_threshold: float = -10.0,
+        include_structure: bool = True
+    ) -> List[Dict]:
+        """
+        Main analysis pipeline
+        
+        Args:
+            sirna_sequence: Guide strand sequence (19-23 nt)
+            max_seed_mismatches: Maximum mismatches in seed region
+            energy_threshold: Minimum binding energy to report (kcal/mol)
+            include_structure: Calculate RNA structure accessibility
+            
+        Returns:
+            List of off-target predictions with scores
+        """
+        # Validate and normalize sequence
+        sirna_sequence = sirna_sequence.upper().replace('T', 'U')
+        
+        if not self._validate_sequence(sirna_sequence):
+            raise ValueError("Invalid siRNA sequence")
+        
+        # Extract seed region (positions 2-8, 0-indexed: 1-7)
+        seed = sirna_sequence[1:8]
+        
+        # Find seed matches in transcriptome
+        seed_matches = self._find_seed_matches(seed, max_seed_mismatches)
+        
+        # Score each potential off-target
+        offtargets = []
+        for match in seed_matches:
+            try:
+                score = self._score_offtarget(
+                    sirna_sequence,
+                    match,
+                    include_structure
+                )
+                
+                if score['delta_g'] <= energy_threshold:
+                    offtargets.append(score)
+            except Exception as e:
+                # Skip matches that cause errors (e.g., sequence too short)
+                print(f"Warning: Skipping match at {match['transcript_id']}:{match['position']} - {str(e)}")
+                continue
+        
+        # Sort by risk score
+        offtargets.sort(key=lambda x: x['risk_score'], reverse=True)
+        
+        return offtargets
+    
+    def _validate_sequence(self, sequence: str) -> bool:
+        """Validate siRNA sequence format"""
+        if len(sequence) < 19 or len(sequence) > 23:
+            return False
+        if not all(c in 'ACGU' for c in sequence):
+            return False
+        return True
+    
+    def _find_seed_matches(
+        self,
+        seed: str,
+        max_mismatches: int
+    ) -> List[Dict]:
+        """
+        Search transcriptome database for seed matches
+        
+        Returns list of matches with transcript info and position
+        """
+        # Get reverse complement for target search
+        seed_rc = str(Seq(seed).reverse_complement())
+        
+        matches = []
+        
+        with get_db_session() as session:
+            # Query seed index for exact and 1-mismatch
+            if max_mismatches == 0:
+                # Exact match only
+                results = session.query(SeedIndex).filter(
+                    SeedIndex.seed_7mer == seed_rc
+                ).all()
+            else:
+                # Include fuzzy matches (simplified - exact for now)
+                results = session.query(SeedIndex).filter(
+                    SeedIndex.seed_7mer == seed_rc
+                ).all()
+            
+            for result in results:
+                # Get full transcript
+                transcript = session.query(Transcript).filter(
+                    Transcript.transcript_id == result.transcript_id
+                ).first()
+                
+                if transcript:
+                    matches.append({
+                        'transcript_id': transcript.transcript_id,
+                        'gene_symbol': transcript.gene_symbol,
+                        'position': result.position,
+                        'sequence': transcript.sequence,
+                        'utr3_start': transcript.utr3_start,
+                        'utr3_end': transcript.utr3_end
+                    })
+        
+        return matches
+    
+    def _score_offtarget(
+        self,
+        sirna_sequence: str,
+        match: Dict,
+        include_structure: bool
+    ) -> Dict:
+        """
+        Calculate comprehensive off-target score
+        
+        Combines:
+        - Thermodynamic binding energy
+        - Position-specific weights
+        - Sequence context
+        - Structure accessibility (optional)
+        """
+        # Extract target site sequence (21 nt window)
+        position = match['position']
+        full_sequence = match['sequence']
+        
+        # Check if we have enough sequence
+        if position + 21 > len(full_sequence):
+            # Not enough sequence after position
+            target_seq = full_sequence[position:]
+            # Pad with N's if needed
+            target_seq = target_seq.ljust(21, 'N')
+        else:
+            target_seq = full_sequence[position:position+21]
+        
+        # Ensure minimum length
+        if len(target_seq) < 7:  # Need at least seed region
+            raise ValueError(f"Target sequence too short: {len(target_seq)} nt")
+        
+        # Reverse complement for pairing
+        target_rc = str(Seq(target_seq).reverse_complement())
+        
+        # Ensure both sequences are same length for comparison
+        min_len = min(len(sirna_sequence), len(target_rc))
+        sirna_trimmed = sirna_sequence[:min_len]
+        target_trimmed = target_rc[:min_len]
+        
+        # Calculate binding energy
+        delta_g = self._calculate_binding_energy(sirna_trimmed, target_trimmed)
+        
+        # Count mismatches
+        mismatches = sum(
+            1 for i in range(min_len)
+            if not self._is_watson_crick(sirna_trimmed[i], target_trimmed[i])
+        )
+        
+        # Seed match quality (check we have enough length)
+        seed_sirna = sirna_sequence[1:8] if len(sirna_sequence) >= 8 else sirna_sequence[1:]
+        seed_target = target_rc[1:8] if len(target_rc) >= 8 else target_rc[1:]
+        seed_matches = self._count_seed_matches(seed_sirna, seed_target)
+        
+        # Context features
+        context_start = max(0, position - 30)
+        context_end = min(len(full_sequence), position + 51)
+        context_seq = full_sequence[context_start:context_end]
+        au_content = self._calculate_au_content(context_seq)
+        
+        # Structure accessibility (simplified)
+        structure_score = 0.5  # Default neutral
+        if include_structure:
+            structure_score = self._predict_accessibility(context_seq, 30)
+        
+        # Combined risk score
+        risk_score = self._calculate_risk_score(
+            delta_g, au_content, structure_score
+        )
+        
+        # Create alignment string
+        alignment = self._format_alignment(sirna_trimmed, target_trimmed)
+        
+        return {
+            'gene_symbol': match['gene_symbol'],
+            'transcript_id': match['transcript_id'],
+            'position': position,
+            'delta_g': round(delta_g, 2),
+            'risk_score': round(risk_score, 3),
+            'seed_matches': seed_matches,
+            'mismatches': mismatches,
+            'alignment': alignment,
+            'au_content': round(au_content, 2),
+            'structure_accessibility': round(structure_score, 2)
+        }
+    
+    def _calculate_binding_energy(self, sirna: str, target: str) -> float:
+        """
+        Calculate nearest-neighbor binding free energy
+        """
+        if len(sirna) != len(target):
+            # Should already be handled, but just in case
+            max_len = max(len(sirna), len(target))
+            sirna = sirna.ljust(max_len, 'N')
+            target = target.ljust(max_len, 'N')
+        
+        delta_g = 0.0
+        
+        # Nearest-neighbor contributions
+        for i in range(len(sirna) - 1):
+            if sirna[i] == 'N' or target[i] == 'N' or sirna[i+1] == 'N' or target[i+1] == 'N':
+                continue
+                
+            pair1 = f"{sirna[i]}{target[i]}"
+            pair2 = f"{sirna[i+1]}{target[i+1]}"
+            nn_key = f"{pair1}/{pair2}"
+            
+            # Look up in parameters
+            nn_energy = self.nn_params.get(nn_key, 0.0)
+            
+            # Apply position-specific weights
+            if 1 <= i <= 7:  # Seed region
+                nn_energy *= self.nn_params['seed_weight']
+            elif 8 <= i <= 12:  # Central
+                nn_energy *= self.nn_params['central_weight']
+            else:  # Supplementary
+                nn_energy *= self.nn_params['supplementary_weight']
+            
+            delta_g += nn_energy
+        
+        # Terminal AU penalty
+        if len(sirna) > 0 and len(target) > 0:
+            if sirna[0] in ['A', 'U'] or sirna[-1] in ['A', 'U']:
+                delta_g += self.nn_params['terminal_AU']
+        
+        return delta_g
+    
+    def _is_watson_crick(self, base1: str, base2: str) -> bool:
+        """Check if bases form Watson-Crick or wobble pair"""
+        pairs = {('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G'), ('G', 'U'), ('U', 'G')}
+        return (base1, base2) in pairs
+    
+    def _count_seed_matches(self, seed_sirna: str, seed_target: str) -> str:
+        """Count matching positions in seed region"""
+        # Use the shorter length to avoid index errors
+        min_len = min(len(seed_sirna), len(seed_target))
+        
+        matches = sum(
+            1 for i in range(min_len)
+            if self._is_watson_crick(seed_sirna[i], seed_target[i])
+        )
+        return f"{matches}/{min_len}"
+    
+    def _calculate_au_content(self, sequence: str) -> float:
+        """Calculate A+U content percentage"""
+        if not sequence:
+            return 0.0
+        au_count = sum(1 for base in sequence.upper() if base in ['A', 'U', 'T'])
+        return (au_count / len(sequence)) * 100
+    
+    def _predict_accessibility(self, sequence: str, target_pos: int) -> float:
+        """
+        Predict target site accessibility
+        Simplified version - returns normalized score
+        """
+        # In full implementation, would use ViennaRNA
+        # For now, use AU content as proxy
+        au_content = self._calculate_au_content(sequence)
+        return min(au_content / 100, 1.0)
+    
+    def _calculate_risk_score(
+        self,
+        delta_g: float,
+        au_content: float,
+        structure_score: float
+    ) -> float:
+        """
+        Combined risk score (0-1 scale)
+        Higher score = higher off-target risk
+        """
+        # Normalize delta_g (-25 to 0 range)
+        dg_normalized = max(0, min(1, (delta_g + 25) / 25))
+        
+        # AU content contribution (normalized)
+        au_score = au_content / 100
+        
+        # Weighted combination
+        risk = (
+            (1 - dg_normalized) * 0.5 +  # Lower (more negative) ΔG = higher risk
+            au_score * 0.2 +
+            structure_score * 0.3
+        )
+        
+        return min(1.0, risk)
+    
+    def _format_alignment(self, sirna: str, target: str) -> str:
+        """Create visual alignment string"""
+        min_len = min(len(sirna), len(target))
+        match_line = ""
+        for i in range(min_len):
+            if self._is_watson_crick(sirna[i], target[i]):
+                match_line += "|"
+            else:
+                match_line += " "
+        
+        alignment = f"siRNA:  5'-{sirna}-3'\n"
+        alignment += f"         {match_line}\n"
+        alignment += f"Target: 3'-{target}-5'"
+        
+        return alignment

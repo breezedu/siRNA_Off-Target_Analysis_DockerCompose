@@ -1,0 +1,242 @@
+import React, { useState } from 'react';
+import axios from 'axios';
+import {
+  AlertCircle,
+  CheckCircle,
+  Loader,
+  Upload,
+  Search,
+  Download,
+  BarChart3
+} from 'lucide-react';
+import './App.css';
+import ResultsDisplay from './components/ResultsDisplay';
+import SequenceInput from './components/SequenceInput';
+import StatusMonitor from './components/StatusMonitor';
+
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+function App() {
+  const [sirnaSequence, setSirnaSequence] = useState('');
+  const [sirnaName, setSirnaName] = useState('');
+  const [jobId, setJobId] = useState(null);
+  const [status, setStatus] = useState('idle'); // idle, submitting, processing, completed, failed
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState(null);
+  const [maxMismatches, setMaxMismatches] = useState(1);
+  const [energyThreshold, setEnergyThreshold] = useState(-10.0);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setStatus('submitting');
+    setError(null);
+    setResults(null);
+
+    try {
+      // Submit analysis request
+      const response = await axios.post(`${API_URL}/api/analyze`, {
+        sirnas: [
+          {
+            name: sirnaName || 'Query siRNA',
+            sequence: sirnaSequence
+          }
+        ],
+        max_seed_mismatches: maxMismatches,
+        energy_threshold: energyThreshold,
+        include_structure: true
+      });
+
+      setJobId(response.data.job_id);
+      setStatus('processing');
+      
+      // Start polling for results
+      pollJobStatus(response.data.job_id);
+    } catch (err) {
+      setStatus('failed');
+      setError(err.response?.data?.detail || 'Failed to submit analysis');
+    }
+  };
+
+  const pollJobStatus = async (jobId) => {
+    const maxAttempts = 60; // 5 minutes max
+    let attempts = 0;
+
+    const poll = setInterval(async () => {
+      attempts++;
+      
+      try {
+        const statusResponse = await axios.get(`${API_URL}/api/status/${jobId}`);
+        
+        if (statusResponse.data.status === 'completed') {
+          clearInterval(poll);
+          fetchResults(jobId);
+        } else if (statusResponse.data.status === 'failed') {
+          clearInterval(poll);
+          setStatus('failed');
+          setError(statusResponse.data.message || 'Analysis failed');
+        } else if (attempts >= maxAttempts) {
+          clearInterval(poll);
+          setStatus('failed');
+          setError('Analysis timed out');
+        }
+      } catch (err) {
+        clearInterval(poll);
+        setStatus('failed');
+        setError('Failed to check job status');
+      }
+    }, 5000); // Poll every 5 seconds
+  };
+
+  const fetchResults = async (jobId) => {
+    try {
+      const response = await axios.get(`${API_URL}/api/results/${jobId}`);
+      setResults(response.data);
+      setStatus('completed');
+    } catch (err) {
+      setStatus('failed');
+      setError('Failed to fetch results');
+    }
+  };
+
+  const downloadResults = () => {
+    if (!results) return;
+
+    // Convert to CSV
+    const csv = convertToCSV(results.offtargets);
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${results.sirna_name}_offtargets.csv`;
+    a.click();
+  };
+
+  const convertToCSV = (offtargets) => {
+    const headers = [
+      'Gene Symbol',
+      'Transcript ID',
+      'Position',
+      'Delta G (kcal/mol)',
+      'Risk Score',
+      'Seed Matches',
+      'Mismatches',
+      'AU Content (%)',
+      'Structure Accessibility'
+    ];
+
+    const rows = offtargets.map(ot => [
+      ot.gene_symbol,
+      ot.transcript_id,
+      ot.position,
+      ot.delta_g,
+      ot.risk_score,
+      ot.seed_matches,
+      ot.mismatches,
+      ot.au_content,
+      ot.structure_accessibility
+    ]);
+
+    return [headers, ...rows].map(row => row.join(',')).join('\n');
+  };
+
+  const resetAnalysis = () => {
+    setSirnaSequence('');
+    setSirnaName('');
+    setJobId(null);
+    setStatus('idle');
+    setResults(null);
+    setError(null);
+  };
+
+  return (
+    <div className="App">
+      <header className="App-header">
+        <div className="header-content">
+          <h1>siRNA Off-Target Analysis Tool</h1>
+          <p className="subtitle">Comprehensive seed-based off-target prediction</p>
+        </div>
+      </header>
+
+      <main className="App-main">
+        <div className="container">
+          {status === 'idle' || status === 'submitting' ? (
+            <div className="input-section">
+              <SequenceInput
+                sirnaName={sirnaName}
+                setSirnaName={setSirnaName}
+                sirnaSequence={sirnaSequence}
+                setSirnaSequence={setSirnaSequence}
+                maxMismatches={maxMismatches}
+                setMaxMismatches={setMaxMismatches}
+                energyThreshold={energyThreshold}
+                setEnergyThreshold={setEnergyThreshold}
+                onSubmit={handleSubmit}
+                isSubmitting={status === 'submitting'}
+              />
+            </div>
+          ) : status === 'processing' ? (
+            <StatusMonitor jobId={jobId} />
+          ) : status === 'completed' && results ? (
+            <div className="results-section">
+              <div className="results-header">
+                <div className="results-title">
+                  <CheckCircle size={28} color="#10b981" />
+                  <h2>Analysis Complete</h2>
+                </div>
+                <div className="results-actions">
+                  <button onClick={downloadResults} className="btn-secondary">
+                    <Download size={18} />
+                    Download CSV
+                  </button>
+                  <button onClick={resetAnalysis} className="btn-primary">
+                    New Analysis
+                  </button>
+                </div>
+              </div>
+
+              <div className="summary-cards">
+                <div className="summary-card high-risk">
+                  <div className="card-label">High Risk</div>
+                  <div className="card-value">{results.high_risk_count}</div>
+                  <div className="card-desc">Risk Score &gt; 0.7</div>
+                </div>
+                <div className="summary-card moderate-risk">
+                  <div className="card-label">Moderate Risk</div>
+                  <div className="card-value">{results.moderate_risk_count}</div>
+                  <div className="card-desc">Risk Score 0.5-0.7</div>
+                </div>
+                <div className="summary-card low-risk">
+                  <div className="card-label">Low Risk</div>
+                  <div className="card-value">{results.low_risk_count}</div>
+                  <div className="card-desc">Risk Score &lt; 0.5</div>
+                </div>
+                <div className="summary-card total">
+                  <div className="card-label">Total Off-Targets</div>
+                  <div className="card-value">{results.total_offtargets}</div>
+                  <div className="card-desc">ΔG ≤ {energyThreshold} kcal/mol</div>
+                </div>
+              </div>
+
+              <ResultsDisplay offtargets={results.offtargets} sirnaName={results.sirna_name} />
+            </div>
+          ) : status === 'failed' ? (
+            <div className="error-section">
+              <AlertCircle size={48} color="#ef4444" />
+              <h2>Analysis Failed</h2>
+              <p>{error}</p>
+              <button onClick={resetAnalysis} className="btn-primary">
+                Try Again
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </main>
+
+      <footer className="App-footer">
+        <p>© 2024 siRNA Off-Target Analysis Tool | Bioinformatics Research</p>
+      </footer>
+    </div>
+  );
+}
+
+export default App;

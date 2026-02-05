@@ -14,7 +14,7 @@ services:
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
       - ./database/data:/data
     ports:
-      - "5433:5432"
+      - "5433:5432"  # Changed from 5432 to avoid conflict
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sirna_user -d sirna_offtarget"]
       interval: 10s
@@ -28,7 +28,7 @@ services:
     image: redis:7-alpine
     container_name: sirna-offtarget-redis
     ports:
-      - "6380:6379"
+      - "6380:6379"  # Changed from 6379 to avoid conflict
     volumes:
       - offtarget_redis_data:/data
     networks:
@@ -48,7 +48,7 @@ services:
       - ./backend:/app
       - offtarget_transcriptome_data:/data/transcriptome
     ports:
-      - "8100:8000"
+      - "8001:8000"  # Changed from 8000 to avoid conflict
     depends_on:
       database:
         condition: service_healthy
@@ -85,12 +85,12 @@ services:
       dockerfile: Dockerfile
     container_name: sirna-offtarget-frontend
     environment:
-      - REACT_APP_API_URL=http://localhost:8100
+      - REACT_APP_API_URL=http://localhost:8001  # Updated to match new backend port
     volumes:
       - ./frontend:/app
       - /app/node_modules
     ports:
-      - "3100:3000"
+      - "3001:3000"  # Changed from 3000 to avoid conflict
     depends_on:
       - backend
     stdin_open: true
