@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for transcriptome data
+  database:
+    image: postgres:15-alpine
+    container_name: sirna-database
+    environment:
+      POSTGRES_DB: sirna_offtarget
+      POSTGRES_USER: sirna_user
+      POSTGRES_PASSWORD: sirna_pass_2024
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/data:/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sirna_user -d sirna_offtarget"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sirna-network
+
+  # Redis for caching and job queue
+  redis:
+    image: redis:7-alpine
+    container_name: sirna-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - sirna-network
+
+  # FastAPI backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sirna-backend
+    environment:
+      - DATABASE_URL=postgresql://sirna_user:sirna_pass_2024@database:5432/sirna_offtarget
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./backend:/app
+      - transcriptome_data:/data/transcriptome
+    ports:
+      - "8000:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - sirna-network
+
+  # Celery worker for background processing
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sirna-worker
+    environment:
+      - DATABASE_URL=postgresql://sirna_user:sirna_pass_2024@database:5432/sirna_offtarget
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./backend:/app
+      - transcriptome_data:/data/transcriptome
+    depends_on:
+      - database
+      - redis
+    command: celery -A tasks.celery_app worker --loglevel=info
+    networks:
+      - sirna-network
+
+  # React frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sirna-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    stdin_open: true
+    tty: true
+    networks:
+      - sirna-network
+
+networks:
+  sirna-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  transcriptome_data:
