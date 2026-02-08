@@ -1,6 +1,6 @@
 """
-Core siRNA Off-Target Analyzer
-Implements seed-based search and thermodynamic scoring
+Core siRNA Off-Target Analyzer - FIXED VERSION
+Implements seed-based search and thermodynamic scoring with correct strand handling
 """
 
 from typing import List, Dict, Tuple
@@ -72,6 +72,8 @@ class SiRNAAnalyzer:
         # Find seed matches in transcriptome
         seed_matches = self._find_seed_matches(seed, max_seed_mismatches)
         
+        print(f"Found {len(seed_matches)} seed matches for seed: {seed}")
+        
         # Score each potential off-target
         offtargets = []
         for match in seed_matches:
@@ -79,11 +81,22 @@ class SiRNAAnalyzer:
                 score = self._score_offtarget(
                     sirna_sequence,
                     match,
+                    max_seed_mismatches,
                     include_structure
                 )
                 
-                if score['delta_g'] <= energy_threshold:
-                    offtargets.append(score)
+                # Filter by seed match quality BEFORE checking energy
+                seed_match_parts = score['seed_matches'].split('/')
+                seed_match_count = int(seed_match_parts[0])
+                seed_length = int(seed_match_parts[1])
+                
+                # Only include if seed matches are within threshold
+                if seed_match_count >= (seed_length - max_seed_mismatches):
+                    if score['delta_g'] <= energy_threshold:
+                        offtargets.append(score)
+                else:
+                    print(f"Filtered out match at {match['transcript_id']}:{match['position']} - seed matches {seed_match_count}/{seed_length} below threshold")
+                    
             except Exception as e:
                 # Skip matches that cause errors (e.g., sequence too short)
                 print(f"Warning: Skipping match at {match['transcript_id']}:{match['position']} - {str(e)}")
@@ -110,25 +123,38 @@ class SiRNAAnalyzer:
         """
         Search transcriptome database for seed matches
         
+        The seed index stores the FORWARD STRAND sequence.
+        We need to search for the reverse complement of our siRNA seed.
+        
         Returns list of matches with transcript info and position
         """
         # Get reverse complement for target search
+        # siRNA binds antiparallel, so we search for RC in the transcriptome
         seed_rc = str(Seq(seed).reverse_complement())
+        
+        print(f"Searching for seed RC: {seed_rc}")
         
         matches = []
         
         with get_db_session() as session:
-            # Query seed index for exact and 1-mismatch
+            # For now, only exact matches (fuzzy matching TODO)
             if max_mismatches == 0:
                 # Exact match only
                 results = session.query(SeedIndex).filter(
                     SeedIndex.seed_7mer == seed_rc
                 ).all()
             else:
-                # Include fuzzy matches (simplified - exact for now)
+                # For max_mismatches > 0, we need to implement fuzzy matching
+                # For now, still using exact match but will filter later by alignment
                 results = session.query(SeedIndex).filter(
                     SeedIndex.seed_7mer == seed_rc
                 ).all()
+                
+                # TODO: Implement proper fuzzy seed matching with:
+                # - Hamming distance calculation
+                # - Position-weighted mismatches (5' end more important)
+            
+            print(f"Found {len(results)} seed index matches")
             
             for result in results:
                 # Get full transcript
@@ -152,10 +178,17 @@ class SiRNAAnalyzer:
         self,
         sirna_sequence: str,
         match: Dict,
+        max_seed_mismatches: int,
         include_structure: bool
     ) -> Dict:
         """
-        Calculate comprehensive off-target score
+        Calculate comprehensive off-target score with CORRECT STRAND HANDLING
+        
+        KEY CONCEPT:
+        - siRNA (5' to 3'): GCCACUGCGCCCGGCCCCC
+        - Target in transcript (5' to 3'): GCAGUGGCUUGGCGCAGGUUA
+        - For antiparallel binding, we align siRNA 5'->3' with target 3'->5'
+        - So we need the REVERSE (not RC) of the target for proper alignment
         
         Combines:
         - Thermodynamic binding energy
@@ -163,44 +196,78 @@ class SiRNAAnalyzer:
         - Sequence context
         - Structure accessibility (optional)
         """
-        # Extract target site sequence (21 nt window)
         position = match['position']
         full_sequence = match['sequence']
+        sirna_len = len(sirna_sequence)
         
-        # Check if we have enough sequence
-        if position + 21 > len(full_sequence):
-            # Not enough sequence after position
-            target_seq = full_sequence[position:]
-            # Pad with N's if needed
-            target_seq = target_seq.ljust(21, 'N')
-        else:
-            target_seq = full_sequence[position:position+21]
+        # Extract target site - get enough sequence for the full siRNA length
+        target_start = position
+        target_end = min(position + sirna_len, len(full_sequence))
         
-        # Ensure minimum length
-        if len(target_seq) < 7:  # Need at least seed region
-            raise ValueError(f"Target sequence too short: {len(target_seq)} nt")
+        available_length = target_end - target_start
         
-        # Reverse complement for pairing
-        target_rc = str(Seq(target_seq).reverse_complement())
+        # Require at least 80% of siRNA length to be alignable
+        min_required_length = int(sirna_len * 0.8)
         
-        # Ensure both sequences are same length for comparison
-        min_len = min(len(sirna_sequence), len(target_rc))
+        if available_length < min_required_length:
+            raise ValueError(
+                f"Target sequence too short for meaningful alignment: "
+                f"only {available_length}/{sirna_len} nt available "
+                f"(need at least {min_required_length})"
+            )
+        
+        if available_length < 7:  # Absolute minimum: need at least seed region
+            raise ValueError(f"Target sequence too short: {available_length} nt")
+        
+        # Extract the target sequence from the transcript (5' to 3')
+        target_forward = full_sequence[target_start:target_end]
+        
+        print(f"\nAnalyzing match at {match['transcript_id']}:{position}")
+        print(f"siRNA (5'->3'):      {sirna_sequence}")
+        print(f"Target fwd (5'->3'): {target_forward}")
+        
+        # For antiparallel binding:
+        # siRNA 5'->3' pairs with target 3'->5'
+        # So we reverse (not reverse complement) the target
+        target_reversed = target_forward[::-1]
+        
+        print(f"Target rev (3'->5'): {target_reversed}")
+        
+        # Now align them for complementarity checking
+        # We need to compare if they are complementary (Watson-Crick pairing)
+        min_len = min(len(sirna_sequence), len(target_reversed))
         sirna_trimmed = sirna_sequence[:min_len]
-        target_trimmed = target_rc[:min_len]
+        target_trimmed = target_reversed[:min_len]
         
-        # Calculate binding energy
+        # Track alignment coverage
+        alignment_coverage = min_len / len(sirna_sequence)
+        
+        print(f"Alignment coverage: {min_len}/{len(sirna_sequence)} nt ({alignment_coverage*100:.1f}%)")
+        
+        # Calculate binding energy with proper pairing
         delta_g = self._calculate_binding_energy(sirna_trimmed, target_trimmed)
         
-        # Count mismatches
+        # Count mismatches (non-complementary positions)
         mismatches = sum(
             1 for i in range(min_len)
-            if not self._is_watson_crick(sirna_trimmed[i], target_trimmed[i])
+            if not self._is_complementary(sirna_trimmed[i], target_trimmed[i])
         )
         
-        # Seed match quality (check we have enough length)
-        seed_sirna = sirna_sequence[1:8] if len(sirna_sequence) >= 8 else sirna_sequence[1:]
-        seed_target = target_rc[1:8] if len(target_rc) >= 8 else target_rc[1:]
-        seed_matches = self._count_seed_matches(seed_sirna, seed_target)
+        print(f"Mismatches: {mismatches}/{min_len}")
+        
+        # Seed match quality (positions 2-8 in siRNA, indices 1-7)
+        seed_start = 1
+        seed_end = min(8, min_len)
+        seed_sirna = sirna_trimmed[seed_start:seed_end]
+        seed_target = target_trimmed[seed_start:seed_end]
+        
+        seed_matches = sum(
+            1 for i in range(len(seed_sirna))
+            if self._is_complementary(seed_sirna[i], seed_target[i])
+        )
+        seed_matches_str = f"{seed_matches}/{len(seed_sirna)}"
+        
+        print(f"Seed matches: {seed_matches_str}")
         
         # Context features
         context_start = max(0, position - 30)
@@ -215,7 +282,7 @@ class SiRNAAnalyzer:
         
         # Combined risk score
         risk_score = self._calculate_risk_score(
-            delta_g, au_content, structure_score
+            delta_g, au_content, structure_score, seed_matches, len(seed_sirna)
         )
         
         # Create alignment string
@@ -227,39 +294,63 @@ class SiRNAAnalyzer:
             'position': position,
             'delta_g': round(delta_g, 2),
             'risk_score': round(risk_score, 3),
-            'seed_matches': seed_matches,
+            'seed_matches': seed_matches_str,
             'mismatches': mismatches,
+            'alignment_coverage': f"{min_len}/{len(sirna_sequence)}",
             'alignment': alignment,
             'au_content': round(au_content, 2),
             'structure_accessibility': round(structure_score, 2)
         }
     
+    def _is_complementary(self, base1: str, base2: str) -> bool:
+        """
+        Check if two bases are complementary in RNA
+        base1 from siRNA (5'->3'), base2 from target (3'->5')
+        
+        Watson-Crick pairs: A-U, U-A, G-C, C-G
+        Wobble pairs: G-U, U-G
+        """
+        complement_pairs = {
+            ('A', 'U'), ('U', 'A'),
+            ('G', 'C'), ('C', 'G'),
+            ('G', 'U'), ('U', 'G')
+        }
+        return (base1, base2) in complement_pairs
+    
     def _calculate_binding_energy(self, sirna: str, target: str) -> float:
         """
         Calculate nearest-neighbor binding free energy
+        
+        Args:
+            sirna: siRNA sequence 5'->3'
+            target: target sequence 3'->5' (reversed from transcript)
         """
         if len(sirna) != len(target):
-            # Should already be handled, but just in case
-            max_len = max(len(sirna), len(target))
-            sirna = sirna.ljust(max_len, 'N')
-            target = target.ljust(max_len, 'N')
+            raise ValueError(f"Sequences must be same length: {len(sirna)} vs {len(target)}")
         
         delta_g = 0.0
         
         # Nearest-neighbor contributions
         for i in range(len(sirna) - 1):
-            if sirna[i] == 'N' or target[i] == 'N' or sirna[i+1] == 'N' or target[i+1] == 'N':
+            # Get the base pairs
+            sirna_pair = sirna[i:i+2]
+            target_pair = target[i:i+2]
+            
+            # Check if bases are complementary
+            if not (self._is_complementary(sirna[i], target[i]) and 
+                    self._is_complementary(sirna[i+1], target[i+1])):
+                # Non-Watson-Crick pairing - skip or penalize
                 continue
-                
-            pair1 = f"{sirna[i]}{target[i]}"
-            pair2 = f"{sirna[i+1]}{target[i+1]}"
-            nn_key = f"{pair1}/{pair2}"
+            
+            # Build nearest-neighbor key
+            # Format: "AB/CD" where A-C and B-D are pairs
+            nn_key = f"{sirna_pair}/{target_pair}"
             
             # Look up in parameters
             nn_energy = self.nn_params.get(nn_key, 0.0)
             
             # Apply position-specific weights
-            if 1 <= i <= 7:  # Seed region
+            if 1 <= i <= 7:  # Seed region (positions 2-8)
                 nn_energy *= self.nn_params['seed_weight']
             elif 8 <= i <= 12:  # Central
                 nn_energy *= self.nn_params['central_weight']
@@ -276,18 +367,16 @@ class SiRNAAnalyzer:
         return delta_g
     
     def _is_watson_crick(self, base1: str, base2: str) -> bool:
-        """Check if bases form Watson-Crick or wobble pair"""
-        pairs = {('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G'), ('G', 'U'), ('U', 'G')}
-        return (base1, base2) in pairs
+        """Legacy method - redirects to _is_complementary"""
+        return self._is_complementary(base1, base2)
     
     def _count_seed_matches(self, seed_sirna: str, seed_target: str) -> str:
         """Count matching positions in seed region"""
-        # Use the shorter length to avoid index errors
         min_len = min(len(seed_sirna), len(seed_target))
         
         matches = sum(
             1 for i in range(min_len)
-            if self._is_watson_crick(seed_sirna[i], seed_target[i])
+            if self._is_complementary(seed_sirna[i], seed_target[i])
         )
         return f"{matches}/{min_len}"
     
@@ -312,11 +401,15 @@ class SiRNAAnalyzer:
         self,
         delta_g: float,
         au_content: float,
-        structure_score: float
+        structure_score: float,
+        seed_matches: int,
+        seed_length: int
     ) -> float:
         """
         Combined risk score (0-1 scale)
         Higher score = higher off-target risk
+        
+        Enhanced with seed match quality
         """
         # Normalize delta_g (-25 to 0 range)
         dg_normalized = max(0, min(1, (delta_g + 25) / 25))
@@ -324,27 +417,39 @@ class SiRNAAnalyzer:
         # AU content contribution (normalized)
         au_score = au_content / 100
         
-        # Weighted combination
+        # Seed match quality (perfect seed = higher risk)
+        seed_quality = seed_matches / seed_length if seed_length > 0 else 0
+        
+        # Weighted combination - seed quality is most important
         risk = (
-            (1 - dg_normalized) * 0.5 +  # Lower (more negative) ΔG = higher risk
-            au_score * 0.2 +
-            structure_score * 0.3
+            (1 - dg_normalized) * 0.3 +  # Lower (more negative) ΔG = higher risk
+            au_score * 0.1 +
+            structure_score * 0.2 +
+            seed_quality * 0.4  # Seed match quality is key predictor
         )
         
         return min(1.0, risk)
     
     def _format_alignment(self, sirna: str, target: str) -> str:
-        """Create visual alignment string"""
+        """
+        Create visual alignment string showing complementarity
+        
+        Args:
+            sirna: siRNA sequence 5'->3'
+            target: target sequence 3'->5' (already reversed)
+        """
         min_len = min(len(sirna), len(target))
         match_line = ""
-        for i in range(min_len):
-            if self._is_watson_crick(sirna[i], target[i]):
-                match_line += "|"
-            else:
-                match_line += " "
         
+        for i in range(min_len):
+            if self._is_complementary(sirna[i], target[i]):
+                match_line += ":"  # Use : for Watson-Crick pairs
+            else:
+                match_line += " "  # Space for mismatch
+        
+        # Format with proper directionality
         alignment = f"siRNA:  5'-{sirna}-3'\n"
-        alignment += f"         {match_line}\n"
+        alignment += f"           {match_line}\n"
         alignment += f"Target: 3'-{target}-5'"
         
         return alignment
