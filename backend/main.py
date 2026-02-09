@@ -66,6 +66,26 @@ class JobStatus(BaseModel):
     progress: Optional[int] = None
     message: Optional[str] = None
 
+class BatchJobEntry(BaseModel):
+    job_id: str
+    sirna_name: str
+
+class BatchAnalysisResponse(BaseModel):
+    batch_id: str
+    jobs: List[BatchJobEntry]
+    total: int
+    created_at: datetime
+
+class BatchStatusRequest(BaseModel):
+    job_ids: List[str]
+
+class BatchJobStatus(BaseModel):
+    job_id: str
+    sirna_name: Optional[str] = None
+    status: str
+    progress: Optional[int] = None
+    message: Optional[str] = None
+
 # Endpoints
 @app.get("/")
 async def root():
@@ -120,6 +140,110 @@ async def analyze_sirna(request: AnalysisRequest, background_tasks: BackgroundTa
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze/batch", response_model=BatchAnalysisResponse)
+async def analyze_sirna_batch(request: AnalysisRequest):
+    """
+    Submit multiple siRNA sequences for off-target analysis.
+    Returns a batch_id and individual job_ids for tracking.
+    """
+    import uuid
+
+    if not request.sirnas:
+        raise HTTPException(status_code=400, detail="No siRNA sequences provided")
+    if len(request.sirnas) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 sequences per batch")
+
+    jobs = []
+    for sirna in request.sirnas:
+        seq = sirna.sequence.upper()
+        if not all(c in 'ACGTU' for c in seq):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sequence for '{sirna.name}'. Only A, C, G, T, U allowed"
+            )
+
+        task = analyze_sirna_task.apply_async(
+            kwargs={
+                'sirna_name': sirna.name,
+                'sirna_sequence': seq,
+                'max_seed_mismatches': request.max_seed_mismatches,
+                'energy_threshold': request.energy_threshold,
+                'include_structure': request.include_structure
+            }
+        )
+        jobs.append(BatchJobEntry(job_id=task.id, sirna_name=sirna.name))
+
+    batch_id = str(uuid.uuid4())
+
+    return BatchAnalysisResponse(
+        batch_id=batch_id,
+        jobs=jobs,
+        total=len(jobs),
+        created_at=datetime.now()
+    )
+
+
+@app.post("/api/batch/status")
+async def batch_job_status(request: BatchStatusRequest):
+    """
+    Check status of multiple analysis jobs at once.
+    """
+    from celery.result import AsyncResult
+    from tasks import celery_app
+
+    statuses = []
+    for job_id in request.job_ids:
+        result = AsyncResult(job_id, app=celery_app)
+
+        if result.state == 'PENDING':
+            statuses.append(BatchJobStatus(job_id=job_id, status='pending', message='Queued'))
+        elif result.state == 'PROGRESS':
+            statuses.append(BatchJobStatus(
+                job_id=job_id,
+                status='processing',
+                progress=result.info.get('progress', 0),
+                message=result.info.get('message', 'Processing...')
+            ))
+        elif result.state == 'SUCCESS':
+            sirna_name = None
+            if isinstance(result.result, dict):
+                sirna_name = result.result.get('sirna_name')
+            statuses.append(BatchJobStatus(
+                job_id=job_id,
+                sirna_name=sirna_name,
+                status='completed',
+                progress=100,
+                message='Complete'
+            ))
+        elif result.state == 'FAILURE':
+            statuses.append(BatchJobStatus(
+                job_id=job_id,
+                status='failed',
+                message=str(result.info)
+            ))
+        else:
+            statuses.append(BatchJobStatus(
+                job_id=job_id,
+                status='unknown',
+                message=f'Unknown state: {result.state}'
+            ))
+
+    completed = sum(1 for s in statuses if s.status == 'completed')
+    failed = sum(1 for s in statuses if s.status == 'failed')
+    total = len(statuses)
+
+    return {
+        "jobs": [s.dict() for s in statuses],
+        "summary": {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "pending": total - completed - failed,
+            "all_done": completed + failed == total
+        }
+    }
+
 
 @app.get("/api/status/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
